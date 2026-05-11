@@ -17,6 +17,7 @@ interface PongreayEnvironment {
   containerPort: number;
 }
 
+
 interface PongreayConfig {
   project: string;
   healthPath: string;
@@ -82,13 +83,13 @@ function output(command: string, args: string[] = []): Promise<string> {
   });
 }
 
-function createDefaultConfig(): void {
+function createDefaultConfig(hostname = "deploy", ip = "your-ip-address"): void {
   const config = `project: my-nestjs-api
 healthPath: /health
 
 environments:
   uat:
-    server: deploy@172.20.15.41
+    server: ${hostname}@${ip}
     branch: develop
     appName: my-nestjs-api-uat
     imageName: my-nestjs-api
@@ -97,7 +98,7 @@ environments:
     containerPort: 3000
 
   production:
-    server: deploy@172.20.15.41
+    server: ${hostname}@${ip}
     branch: main
     appName: my-nestjs-api
     imageName: my-nestjs-api
@@ -289,8 +290,10 @@ program
 program
   .command("init")
   .description("Create pongreay.config.yml")
-  .action(() => {
-    createDefaultConfig();
+  .option("--hostname <hostname>", "SSH hostname", "deploy")
+  .option("--ip <ip>", "Server IP address", "your-ip-address")
+  .action((options: { hostname: string; ip: string }) => {
+    createDefaultConfig(options.hostname, options.ip);
   });
 
 program
