@@ -2,6 +2,7 @@
 
 import { Command } from "commander";
 import fs from "node:fs";
+import os from "node:os";
 import YAML from "yaml";
 import { spawn } from "node:child_process";
 
@@ -34,7 +35,7 @@ function run(command: string, args: string[] = []): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: "inherit",
-      shell: false,
+      shell: process.platform === "win32" && command === "npm",
     });
 
     child.on("close", (code) => {
@@ -62,7 +63,7 @@ function output(command: string, args: string[] = []): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
-      shell: false,
+      shell: process.platform === "win32" && command === "npm",
     });
 
     let stdout = "";
@@ -193,23 +194,23 @@ async function deploy(
 
   const commitHash = await output("git", ["rev-parse", "--short", "HEAD"]);
   const imageTag = `${env.imageName}:${environmentName}-${commitHash}`;
-  const tarFile = `/tmp/${env.imageName}-${environmentName}-${commitHash}.tar.gz`;
+  const tarFile = `${os.tmpdir()}/${env.imageName}-${environmentName}-${commitHash}.tar`;
 
   console.log(`Building Docker image: ${imageTag}`);
   await run("docker", ["build", "-t", imageTag, "."]);
 
   console.log("Saving Docker image...");
-  await runShell(`docker save ${imageTag} | gzip > ${tarFile}`);
+  await runShell(`docker save ${imageTag} > ${tarFile}`);
 
   console.log("Uploading image to server...");
-  await run("scp", [tarFile, `${env.server}:${tarFile}`]);
+  const remoteTarFile = `/tmp/${env.imageName}-${environmentName}-${commitHash}.tar`; await run("scp", [tarFile, `${env.server}:${remoteTarFile}`]);
 
   const remoteCommand = `
 set -e
 
 APP_NAME="${env.appName}"
 IMAGE_TAG="${imageTag}"
-IMAGE_FILE="${tarFile}"
+IMAGE_FILE="${remoteTarFile}"
 ENV_FILE="${env.envFileOnServer}"
 HOST_PORT="${env.hostPort}"
 CONTAINER_PORT="${env.containerPort}"
@@ -222,7 +223,7 @@ echo "Remember old image..."
 OLD_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$APP_NAME" 2>/dev/null || true)
 
 echo "Loading Docker image..."
-gunzip -c "$IMAGE_FILE" | docker load
+docker load < "$IMAGE_FILE"
 
 echo "Stopping old container..."
 docker stop "$APP_NAME" 2>/dev/null || true
@@ -317,3 +318,5 @@ program
   });
 
 program.parse();
+
+
