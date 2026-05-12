@@ -29,9 +29,15 @@ interface DeployOptions {
   confirm?: boolean;
   dryRun?: boolean;
   skipTests?: boolean;
+  noCache?: boolean;
+  buildArg?: string[];
+  timeout?: string;
+  keepImages?: string;
 }
 
 const REQUIRED_DOCKERIGNORE_ENTRIES = [".env", ".env.*", "!.env.example"];
+const DEFAULT_HEALTH_TIMEOUT_SECONDS = 30;
+const DEFAULT_KEEP_IMAGES = 5;
 
 function run(command: string, args: string[] = []): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -84,6 +90,39 @@ function output(command: string, args: string[] = []): Promise<string> {
       else reject(new Error(stderr || `${command} failed`));
     });
   });
+}
+
+function collect(value: string, previous: string[]): string[] {
+  return previous.concat(value);
+}
+
+function parsePositiveInteger(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+
+  const parsed = Number.parseInt(value, 10);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Expected a positive integer, received: ${value}`);
+  }
+
+  return parsed;
+}
+
+function shellQuote(value: string | number): string {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function getEnvironment(
+  config: PongreayConfig,
+  environmentName: string,
+): PongreayEnvironment {
+  const env = config.environments[environmentName];
+
+  if (!env) {
+    throw new Error(`Unknown environment: ${environmentName}`);
+  }
+
+  return env;
 }
 
 function createDefaultConfig(hostname = "deploy", ip = "your-ip-address"): void {
@@ -193,6 +232,37 @@ function assertEnvFileOutsideApp(envFileOnServer: string): void {
   }
 }
 
+function validateConfig(): PongreayConfig {
+  const config = loadConfig();
+
+  if (!config.environments || Object.keys(config.environments).length === 0) {
+    throw new Error("At least one environment is required.");
+  }
+
+  for (const [name, env] of Object.entries(config.environments)) {
+    const requiredFields: Array<keyof PongreayEnvironment> = [
+      "server",
+      "branch",
+      "appName",
+      "imageName",
+      "envFileOnServer",
+      "hostPort",
+      "containerPort",
+    ];
+
+    for (const field of requiredFields) {
+      if (env[field] === undefined || env[field] === "") {
+        throw new Error(`Missing environments.${name}.${field}`);
+      }
+    }
+
+    assertEnvFileOutsideApp(env.envFileOnServer);
+  }
+
+  assertDockerignoreProtectsEnv();
+  return config;
+}
+
 async function assertBranch(requiredBranch: string): Promise<void> {
   const currentBranch = await output("git", ["branch", "--show-current"]);
 
@@ -216,11 +286,15 @@ async function deploy(
   options: DeployOptions,
 ): Promise<void> {
   const config = loadConfig();
-  const env = config.environments[environmentName];
-
-  if (!env) {
-    throw new Error(`Unknown environment: ${environmentName}`);
-  }
+  const env = getEnvironment(config, environmentName);
+  const healthTimeout = parsePositiveInteger(
+    options.timeout,
+    DEFAULT_HEALTH_TIMEOUT_SECONDS,
+  );
+  const keepImages = parsePositiveInteger(
+    options.keepImages,
+    DEFAULT_KEEP_IMAGES,
+  );
 
   if (environmentName === "production" && !options.confirm) {
     throw new Error(
@@ -258,9 +332,18 @@ async function deploy(
   const commitHash = await output("git", ["rev-parse", "--short", "HEAD"]);
   const imageTag = `${env.imageName}:${environmentName}-${commitHash}`;
   const tarFile = `${os.tmpdir()}/${env.imageName}-${environmentName}-${commitHash}.tar`;
+  const buildArgs = options.buildArg ?? [];
+  const dockerBuildArgs = [
+    "build",
+    ...(options.noCache ? ["--no-cache"] : []),
+    ...buildArgs.flatMap((arg) => ["--build-arg", arg]),
+    "-t",
+    imageTag,
+    ".",
+  ];
 
   console.log(`Building Docker image: ${imageTag}`);
-  await run("docker", ["build", "-t", imageTag, "."]);
+  await run("docker", dockerBuildArgs);
 
   console.log("Saving Docker image...");
   await runShell(`docker save ${imageTag} > ${tarFile}`);
@@ -271,13 +354,17 @@ async function deploy(
   const remoteCommand = `
 set -e
 
-APP_NAME="${env.appName}"
-IMAGE_TAG="${imageTag}"
-IMAGE_FILE="${remoteTarFile}"
-ENV_FILE="${env.envFileOnServer}"
-HOST_PORT="${env.hostPort}"
-CONTAINER_PORT="${env.containerPort}"
-HEALTH_URL="http://127.0.0.1:${env.hostPort}${config.healthPath}"
+APP_NAME=${shellQuote(env.appName)}
+IMAGE_REPO=${shellQuote(env.imageName)}
+ENV_NAME=${shellQuote(environmentName)}
+IMAGE_TAG=${shellQuote(imageTag)}
+IMAGE_FILE=${shellQuote(remoteTarFile)}
+ENV_FILE=${shellQuote(env.envFileOnServer)}
+HOST_PORT=${shellQuote(env.hostPort)}
+CONTAINER_PORT=${shellQuote(env.containerPort)}
+HEALTH_URL=${shellQuote(`http://127.0.0.1:${env.hostPort}${config.healthPath}`)}
+HEALTH_TIMEOUT=${shellQuote(healthTimeout)}
+KEEP_IMAGES=${shellQuote(keepImages)}
 
 echo "Checking env file..."
 if [ ! -f "$ENV_FILE" ]; then
@@ -322,13 +409,16 @@ docker run -d \\
   --name "$APP_NAME" \\
   --restart unless-stopped \\
   --env-file "$ENV_FILE" \\
+  --label "pongreay.environment=$ENV_NAME" \\
+  --label "pongreay.previous-image=$OLD_IMAGE" \\
   -p "$HOST_PORT:$CONTAINER_PORT" \\
   "$IMAGE_TAG"
 
 echo "Checking health..."
 SUCCESS=false
+ATTEMPTS=$(( (HEALTH_TIMEOUT + 2) / 3 ))
 
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for i in $(seq 1 "$ATTEMPTS"); do
   if curl -fsS "$HEALTH_URL" > /dev/null; then
     SUCCESS=true
     break
@@ -341,6 +431,12 @@ done
 if [ "$SUCCESS" = "true" ]; then
   echo "Deployment success."
   rm -f "$IMAGE_FILE"
+  if [ "$KEEP_IMAGES" -gt 0 ]; then
+    docker images "$IMAGE_REPO" --format '{{.Repository}}:{{.Tag}}' \\
+      | grep ":$ENV_NAME-" \\
+      | tail -n +"$((KEEP_IMAGES + 1))" \\
+      | xargs -r docker rmi 2>/dev/null || true
+  fi
   exit 0
 fi
 
@@ -354,6 +450,7 @@ if [ -n "$OLD_IMAGE" ]; then
     --name "$APP_NAME" \\
     --restart unless-stopped \\
     --env-file "$ENV_FILE" \\
+    --label "pongreay.environment=$ENV_NAME" \\
     -p "$HOST_PORT:$CONTAINER_PORT" \\
     "$OLD_IMAGE"
 fi
@@ -367,6 +464,134 @@ exit 1
 
   console.log("");
   console.log("Deployment successful.");
+}
+
+async function showLogs(
+  environmentName: string,
+  options: { tail?: string },
+): Promise<void> {
+  const config = loadConfig();
+  const env = getEnvironment(config, environmentName);
+  const tail = parsePositiveInteger(options.tail, 200);
+
+  await run("ssh", [
+    env.server,
+    `docker logs --tail ${shellQuote(tail)} -f ${shellQuote(env.appName)}`,
+  ]);
+}
+
+async function showStatus(environmentName: string): Promise<void> {
+  const config = loadConfig();
+  const env = getEnvironment(config, environmentName);
+  const command = `
+APP_NAME=${shellQuote(env.appName)}
+HEALTH_URL=${shellQuote(`http://127.0.0.1:${env.hostPort}${config.healthPath}`)}
+
+echo "Container:"
+docker ps -a --filter "name=^/$APP_NAME$" --format "name={{.Names}} status={{.Status}} image={{.Image}} ports={{.Ports}}"
+echo ""
+echo "Image:"
+docker inspect --format='{{.Config.Image}}' "$APP_NAME" 2>/dev/null || true
+echo ""
+echo "Health:"
+curl -fsS "$HEALTH_URL" >/dev/null && echo "healthy: $HEALTH_URL" || echo "unhealthy: $HEALTH_URL"
+`;
+
+  await run("ssh", [env.server, command]);
+}
+
+async function rollback(environmentName: string): Promise<void> {
+  const config = loadConfig();
+  const env = getEnvironment(config, environmentName);
+  const command = `
+set -e
+
+APP_NAME=${shellQuote(env.appName)}
+ENV_NAME=${shellQuote(environmentName)}
+ENV_FILE=${shellQuote(env.envFileOnServer)}
+HOST_PORT=${shellQuote(env.hostPort)}
+CONTAINER_PORT=${shellQuote(env.containerPort)}
+HEALTH_URL=${shellQuote(`http://127.0.0.1:${env.hostPort}${config.healthPath}`)}
+
+PREVIOUS_IMAGE=$(docker inspect --format='{{ index .Config.Labels "pongreay.previous-image" }}' "$APP_NAME" 2>/dev/null || true)
+
+if [ -z "$PREVIOUS_IMAGE" ] || [ "$PREVIOUS_IMAGE" = "<no value>" ]; then
+  echo "No previous image recorded for $APP_NAME."
+  exit 1
+fi
+
+echo "Rolling back $APP_NAME to $PREVIOUS_IMAGE..."
+docker stop "$APP_NAME" 2>/dev/null || true
+docker rm "$APP_NAME" 2>/dev/null || true
+docker run -d \\
+  --name "$APP_NAME" \\
+  --restart unless-stopped \\
+  --env-file "$ENV_FILE" \\
+  --label "pongreay.environment=$ENV_NAME" \\
+  -p "$HOST_PORT:$CONTAINER_PORT" \\
+  "$PREVIOUS_IMAGE"
+
+curl -fsS "$HEALTH_URL" >/dev/null
+echo "Rollback successful."
+`;
+
+  await run("ssh", [env.server, command]);
+}
+
+async function doctor(environmentName?: string): Promise<void> {
+  console.log("Pongreay Doctor");
+  console.log("---------------");
+
+  const checks = [
+    ["git", ["--version"]],
+    ["docker", ["--version"]],
+    ["ssh", ["-V"]],
+    ["scp", ["-V"]],
+  ] as const;
+
+  for (const [command, args] of checks) {
+    try {
+      await output(command, [...args]);
+      console.log(`OK local ${command}`);
+    } catch {
+      console.log(`FAIL local ${command}`);
+    }
+  }
+
+  const config = validateConfig();
+  console.log(`OK ${CONFIG_FILE}`);
+  console.log("OK .dockerignore");
+
+  if (!environmentName) return;
+
+  const env = getEnvironment(config, environmentName);
+  const remoteCommand = `
+set -e
+ENV_FILE=${shellQuote(env.envFileOnServer)}
+command -v docker >/dev/null && echo "OK remote docker" || echo "FAIL remote docker"
+if [ -f "$ENV_FILE" ]; then
+  echo "OK remote env exists"
+  stat -c "env owner=%U group=%G perms=%a path=%n" "$ENV_FILE"
+else
+  echo "FAIL remote env missing: $ENV_FILE"
+fi
+`;
+
+  await run("ssh", [env.server, remoteCommand]);
+}
+
+function printEnvSetup(environmentName: string): void {
+  const config = loadConfig();
+  const env = getEnvironment(config, environmentName);
+  const directory = env.envFileOnServer.replace(/\/[^/]+$/, "");
+  const deployUser = env.server.includes("@") ? env.server.split("@")[0] : "$USER";
+
+  console.log(`sudo mkdir -p ${shellQuote(directory)}`);
+  console.log(`sudo nano ${shellQuote(env.envFileOnServer)}`);
+  console.log(
+    `sudo chown ${shellQuote(`${deployUser}:${deployUser}`)} ${shellQuote(env.envFileOnServer)}`,
+  );
+  console.log(`sudo chmod 600 ${shellQuote(env.envFileOnServer)}`);
 }
 
 const program = new Command();
@@ -386,10 +611,103 @@ program
   });
 
 program
+  .command("config")
+  .description("Configuration commands")
+  .command("validate")
+  .description("Validate pongreay.config.yml and local env safeguards")
+  .action(() => {
+    try {
+      validateConfig();
+      console.log("Configuration is valid.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("doctor")
+  .description("Check local tools, config, and optionally remote environment")
+  .argument("[environment]", "environment to check remotely")
+  .action(async (environment: string | undefined) => {
+    try {
+      await doctor(environment);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+  });
+
+const envCommand = program.command("env").description("Environment helpers");
+
+envCommand
+  .command("setup")
+  .description("Print secure server env-file setup commands")
+  .argument("<environment>", "environment to prepare")
+  .action((environment: string) => {
+    try {
+      printEnvSetup(environment);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("logs")
+  .description("Tail remote container logs")
+  .argument("<environment>", "environment to inspect")
+  .option("--tail <lines>", "number of log lines", "200")
+  .action(async (environment: string, options: { tail?: string }) => {
+    try {
+      await showLogs(environment, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("status")
+  .description("Show remote container and health status")
+  .argument("<environment>", "environment to inspect")
+  .action(async (environment: string) => {
+    try {
+      await showStatus(environment);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command("rollback")
+  .description("Rollback to the previous image recorded by the last deploy")
+  .argument("<environment>", "environment to rollback")
+  .action(async (environment: string) => {
+    try {
+      await rollback(environment);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+  });
+
+program
   .argument("[environment]", "uat or production")
   .option("--confirm", "confirm production deployment")
   .option("--dry-run", "preview only")
   .option("--skip-tests", "skip npm test")
+  .option("--no-cache", "build Docker image without cache")
+  .option("--build-arg <arg>", "pass Docker build argument", collect, [])
+  .option("--timeout <seconds>", "health-check timeout in seconds", "30")
+  .option("--keep-images <count>", "remote images to keep after success", "5")
   .action(async (environment: string | undefined, options: DeployOptions) => {
     try {
       if (!environment) {

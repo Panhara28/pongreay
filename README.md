@@ -12,6 +12,8 @@ Pongreay simplifies the process of building, uploading, and deploying Docker con
 - **Zero-Downtime-ish Deployment:** Stops the old container and starts the new one, with quick health checks.
 - **Automatic Rollback:** If the new container fails its health check, Pongreay automatically rolls back to the previous version.
 - **Simple Configuration:** Single YAML file to manage all your environments.
+- **Operational Commands:** Inspect status, stream logs, run diagnostics, and trigger manual rollback.
+- **Safer Env Handling:** Blocks deploys when local `.env` files could enter the Docker image.
 
 ## Installation
 
@@ -97,6 +99,69 @@ Deploys the application to the specified environment.
 - `--confirm`: Required for deploying to the `production` environment.
 - `--dry-run`: Shows the deployment plan without executing any remote commands.
 - `--skip-tests`: Skips running `npm test` before the build process.
+- `--no-cache`: Builds the Docker image without using cache.
+- `--build-arg <arg>`: Passes a Docker build argument, for example `--build-arg NODE_ENV=production`. Can be used multiple times.
+- `--timeout <seconds>`: Sets health-check timeout duration. Default: `30`.
+- `--keep-images <count>`: Keeps the newest matching remote images after successful deploy. Default: `5`.
+
+### `pongreay config validate`
+
+Validates `pongreay.config.yml`, required environment fields, secure env-file paths, and `.dockerignore` env exclusions.
+
+```bash
+pongreay config validate
+```
+
+### `pongreay doctor [environment]`
+
+Checks local tools (`git`, `docker`, `ssh`, `scp`), validates config, and optionally checks remote Docker/env-file status.
+
+```bash
+pongreay doctor
+pongreay doctor uat
+```
+
+### `pongreay env setup <environment>`
+
+Prints secure server setup commands for the configured env file.
+
+```bash
+pongreay env setup uat
+```
+
+Example output:
+
+```bash
+sudo mkdir -p '/etc/pongreay/my-app'
+sudo nano '/etc/pongreay/my-app/uat.env'
+sudo chown 'deploy:deploy' '/etc/pongreay/my-app/uat.env'
+sudo chmod 600 '/etc/pongreay/my-app/uat.env'
+```
+
+### `pongreay status <environment>`
+
+Shows the remote container, current image, mapped ports, and health-check result.
+
+```bash
+pongreay status uat
+```
+
+### `pongreay logs <environment>`
+
+Streams remote Docker logs for the configured container.
+
+```bash
+pongreay logs uat
+pongreay logs uat --tail 500
+```
+
+### `pongreay rollback <environment>`
+
+Rolls back to the previous image recorded during the last Pongreay deploy.
+
+```bash
+pongreay rollback uat
+```
 
 ## Environment File Security
 
@@ -140,10 +205,10 @@ sudo chmod 600 /etc/pongreay/my-app/production.env
 6. **Remote Execution:**
    - Loads the Docker image on the server.
    - Stops and removes the existing container.
-   - Starts the new container with the specified ports and environment file.
+   - Starts the new container with the specified ports, environment file, and rollback labels.
    - Performs a health check against the `healthPath`.
 7. **Cleanup/Rollback:** 
-   - On success: Removes the temporary image file from the server.
+   - On success: Removes the temporary image file from the server and prunes old matching images according to `--keep-images`.
    - On failure: Restarts the previous container and exits with an error.
 
 ## License
