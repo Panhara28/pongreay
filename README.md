@@ -49,7 +49,7 @@ environments:
     branch: develop
     appName: my-app-uat
     imageName: my-app
-    envFileOnServer: /opt/apps/my-app/uat.env
+    envFileOnServer: /etc/pongreay/my-app/uat.env
     hostPort: 3000
     containerPort: 3000
 
@@ -58,7 +58,7 @@ environments:
     branch: main
     appName: my-app-prod
     imageName: my-app
-    envFileOnServer: /opt/apps/my-app/prod.env
+    envFileOnServer: /etc/pongreay/my-app/prod.env
     hostPort: 8080
     containerPort: 3000
 ```
@@ -98,6 +98,27 @@ Deploys the application to the specified environment.
 - `--dry-run`: Shows the deployment plan without executing any remote commands.
 - `--skip-tests`: Skips running `npm test` before the build process.
 
+## Environment File Security
+
+Pongreay does not upload your local `.env` file and does not copy it into the Docker image. The container receives environment variables at runtime from `envFileOnServer`.
+
+Before deployment, Pongreay requires:
+
+- `.dockerignore` contains `.env` and `.env.*`.
+- `envFileOnServer` is under `/etc/pongreay/`, outside the app directory.
+- The server env file exists and is readable by the deploy user.
+- The server env file owner is the deploy user or `root`.
+- The server env file permissions are `600` or `400`; Pongreay attempts `chmod 600` before enforcing this.
+
+Example server setup:
+
+```bash
+sudo mkdir -p /etc/pongreay/my-app
+sudo nano /etc/pongreay/my-app/production.env
+sudo chown deploy:deploy /etc/pongreay/my-app/production.env
+sudo chmod 600 /etc/pongreay/my-app/production.env
+```
+
 ## Requirements
 
 - **Local Machine:**
@@ -107,7 +128,7 @@ Deploys the application to the specified environment.
   - Node.js (for running the CLI)
 - **Remote Server:**
   - Docker
-  - An environment file (specified in `envFileOnServer`) already present on the disk.
+  - A protected environment file under `/etc/pongreay/` specified by `envFileOnServer`.
 
 ## How it Works
 

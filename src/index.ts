@@ -31,6 +31,8 @@ interface DeployOptions {
   skipTests?: boolean;
 }
 
+const REQUIRED_DOCKERIGNORE_ENTRIES = [".env", ".env.*", "!.env.example"];
+
 function run(command: string, args: string[] = []): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -94,7 +96,7 @@ environments:
     branch: develop
     appName: my-nestjs-api-uat
     imageName: my-nestjs-api
-    envFileOnServer: /opt/pongreay/my-nestjs-api/uat.env
+    envFileOnServer: /etc/pongreay/my-nestjs-api/uat.env
     hostPort: 3000
     containerPort: 3000
 
@@ -103,7 +105,7 @@ environments:
     branch: main
     appName: my-nestjs-api
     imageName: my-nestjs-api
-    envFileOnServer: /opt/pongreay/my-nestjs-api/production.env
+    envFileOnServer: /etc/pongreay/my-nestjs-api/production.env
     hostPort: 3000
     containerPort: 3000
 `;
@@ -115,6 +117,7 @@ environments:
 
   fs.writeFileSync(CONFIG_FILE, config, "utf8");
   console.log(`Created ${CONFIG_FILE}`);
+  ensureDockerignore();
 }
 
 function loadConfig(): PongreayConfig {
@@ -130,6 +133,64 @@ function loadConfig(): PongreayConfig {
   if (!config.environments) throw new Error("Missing config: environments");
 
   return config;
+}
+
+function ensureDockerignore(): void {
+  const dockerignoreFile = ".dockerignore";
+  const existingContent = fs.existsSync(dockerignoreFile)
+    ? fs.readFileSync(dockerignoreFile, "utf8")
+    : "";
+  const existingEntries = new Set(
+    existingContent
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#")),
+  );
+  const missingEntries = REQUIRED_DOCKERIGNORE_ENTRIES.filter(
+    (entry) => !existingEntries.has(entry),
+  );
+
+  if (missingEntries.length === 0) return;
+
+  const prefix = existingContent && !existingContent.endsWith("\n") ? "\n" : "";
+  const section = `${prefix}\n# Pongreay: keep local secrets out of Docker images\n${missingEntries.join("\n")}\n`;
+  fs.appendFileSync(dockerignoreFile, section, "utf8");
+  console.log(`Updated ${dockerignoreFile} to exclude local env files.`);
+}
+
+function assertDockerignoreProtectsEnv(): void {
+  const dockerignoreFile = ".dockerignore";
+
+  if (!fs.existsSync(dockerignoreFile)) {
+    throw new Error(
+      `Missing ${dockerignoreFile}. Run: pongreay init, or add .env and .env.* before deploying.`,
+    );
+  }
+
+  const entries = new Set(
+    fs
+      .readFileSync(dockerignoreFile, "utf8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#")),
+  );
+  const missingEntries = [".env", ".env.*"].filter(
+    (entry) => !entries.has(entry),
+  );
+
+  if (missingEntries.length > 0) {
+    throw new Error(
+      `${dockerignoreFile} must exclude local env files before deploy. Missing: ${missingEntries.join(", ")}`,
+    );
+  }
+}
+
+function assertEnvFileOutsideApp(envFileOnServer: string): void {
+  if (!envFileOnServer.startsWith("/etc/pongreay/")) {
+    throw new Error(
+      `envFileOnServer must be outside the app directory, preferably under /etc/pongreay/. Current: ${envFileOnServer}`,
+    );
+  }
 }
 
 async function assertBranch(requiredBranch: string): Promise<void> {
@@ -186,6 +247,8 @@ async function deploy(
 
   await assertBranch(env.branch);
   await assertCleanGit();
+  assertDockerignoreProtectsEnv();
+  assertEnvFileOutsideApp(env.envFileOnServer);
 
   if (!options.skipTests) {
     console.log("Running tests...");
@@ -218,6 +281,23 @@ HEALTH_URL="http://127.0.0.1:${env.hostPort}${config.healthPath}"
 
 echo "Checking env file..."
 test -f "$ENV_FILE"
+test -r "$ENV_FILE"
+
+ENV_OWNER=$(stat -c "%U" "$ENV_FILE")
+CURRENT_USER=$(id -un)
+
+if [ "$ENV_OWNER" != "$CURRENT_USER" ] && [ "$ENV_OWNER" != "root" ]; then
+  echo "Env file owner must be $CURRENT_USER or root. Current owner: $ENV_OWNER"
+  exit 1
+fi
+
+chmod 600 "$ENV_FILE" 2>/dev/null || true
+ENV_PERMS=$(stat -c "%a" "$ENV_FILE")
+
+if [ "$ENV_PERMS" != "600" ] && [ "$ENV_PERMS" != "400" ]; then
+  echo "Env file permissions must be 600 or 400. Current permissions: $ENV_PERMS"
+  exit 1
+fi
 
 echo "Remember old image..."
 OLD_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$APP_NAME" 2>/dev/null || true)
