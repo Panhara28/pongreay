@@ -280,8 +280,16 @@ CONTAINER_PORT="${env.containerPort}"
 HEALTH_URL="http://127.0.0.1:${env.hostPort}${config.healthPath}"
 
 echo "Checking env file..."
-test -f "$ENV_FILE"
-test -r "$ENV_FILE"
+if [ ! -f "$ENV_FILE" ]; then
+  echo "Env file does not exist: $ENV_FILE"
+  echo "Create it on the server, then set owner to the deploy user or root and permissions to 600."
+  exit 1
+fi
+
+if [ ! -r "$ENV_FILE" ]; then
+  echo "Env file is not readable by $(id -un): $ENV_FILE"
+  exit 1
+fi
 
 ENV_OWNER=$(stat -c "%U" "$ENV_FILE")
 CURRENT_USER=$(id -un)
