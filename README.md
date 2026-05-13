@@ -100,9 +100,24 @@ Deploys the application to the specified environment.
 - `--dry-run`: Shows the deployment plan without executing any remote commands.
 - `--skip-tests`: Skips running `npm test` before the build process.
 - `--no-cache`: Builds the Docker image without using cache.
-- `--build-arg <arg>`: Passes a Docker build argument, for example `--build-arg NODE_ENV=production`. Can be used multiple times.
+- `--build-arg <arg>`: Passes a non-secret Docker build argument, for example `--build-arg NODE_ENV=production`. Secret-like names such as `TOKEN`, `PASSWORD`, `SECRET`, or `API_KEY` are blocked. Can be used multiple times.
+- `--build-secret <secret>`: Passes a Docker BuildKit secret, for example `--build-secret id=npmrc,src=.npmrc`. Can be used multiple times.
 - `--timeout <seconds>`: Sets health-check timeout duration. Default: `30`.
 - `--keep-images <count>`: Keeps the newest matching remote images after successful deploy. Default: `5`.
+
+### Build Secrets
+
+Do not pass secrets through `--build-arg`; Docker may store build args in image metadata, build cache, or history.
+
+Use `--build-secret` with a Dockerfile BuildKit secret mount:
+
+```bash
+pongreay uat --build-secret id=npmrc,src=.npmrc
+```
+
+```dockerfile
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+```
 
 ### `pongreay config validate`
 

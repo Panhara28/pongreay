@@ -31,6 +31,7 @@ interface DeployOptions {
   skipTests?: boolean;
   noCache?: boolean;
   buildArg?: string[];
+  buildSecret?: string[];
   timeout?: string;
   keepImages?: string;
 }
@@ -38,6 +39,8 @@ interface DeployOptions {
 const REQUIRED_DOCKERIGNORE_ENTRIES = [".env", ".env.*", "!.env.example"];
 const DEFAULT_HEALTH_TIMEOUT_SECONDS = 30;
 const DEFAULT_KEEP_IMAGES = 5;
+const SENSITIVE_BUILD_ARG_PATTERN =
+  /(secret|token|password|passwd|pwd|private|credential|auth|api[_-]?key|access[_-]?key)/i;
 
 function run(command: string, args: string[] = []): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -49,20 +52,6 @@ function run(command: string, args: string[] = []): Promise<void> {
     child.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${command} failed with code ${code}`));
-    });
-  });
-}
-
-function runShell(command: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, {
-      stdio: "inherit",
-      shell: true,
-    });
-
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Command failed: ${command}`));
     });
   });
 }
@@ -92,6 +81,52 @@ function output(command: string, args: string[] = []): Promise<string> {
   });
 }
 
+function saveDockerImage(imageTag: string, tarFile: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const outputFile = fs.createWriteStream(tarFile, { flags: "w" });
+    const child = spawn("docker", ["save", imageTag], {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    let childExited = false;
+    let outputFinished = false;
+    let failed = false;
+
+    const fail = (error: Error): void => {
+      if (failed) return;
+      failed = true;
+      outputFile.destroy();
+      reject(error);
+    };
+
+    const finish = (): void => {
+      if (!failed && childExited && outputFinished) resolve();
+    };
+
+    child.stdout.pipe(outputFile);
+
+    child.on("error", (error) => {
+      fail(error);
+    });
+
+    outputFile.on("error", (error) => {
+      child.kill();
+      fail(error);
+    });
+
+    outputFile.on("finish", () => {
+      outputFinished = true;
+      finish();
+    });
+
+    child.on("close", (code) => {
+      childExited = true;
+
+      if (code === 0) finish();
+      else fail(new Error(`docker save failed with code ${code}`));
+    });
+  });
+}
+
 function collect(value: string, previous: string[]): string[] {
   return previous.concat(value);
 }
@@ -108,8 +143,64 @@ function parsePositiveInteger(value: string | undefined, fallback: number): numb
   return parsed;
 }
 
+function getBuildArgName(buildArg: string): string {
+  return buildArg.split("=", 1)[0];
+}
+
+function assertSafeBuildArgs(buildArgs: string[]): void {
+  for (const buildArg of buildArgs) {
+    const name = getBuildArgName(buildArg);
+
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(
+        `Invalid build arg name: ${name}. Expected a Docker ARG name like NODE_ENV.`,
+      );
+    }
+
+    if (SENSITIVE_BUILD_ARG_PATTERN.test(name)) {
+      throw new Error(
+        `Refusing secret-like build arg: ${name}. Use --build-secret id=${name.toLowerCase()},src=<file> instead.`,
+      );
+    }
+  }
+}
+
+function toDockerBuildSecretArgs(buildSecrets: string[]): string[] {
+  return buildSecrets.flatMap((secret) => {
+    if (!/^id=[A-Za-z_][A-Za-z0-9_-]*,src=.+$/.test(secret)) {
+      throw new Error(
+        `Invalid build secret: ${secret}. Expected id=<name>,src=<file>.`,
+      );
+    }
+
+    const source = secret.slice(secret.indexOf(",src=") + 5);
+
+    if (!fs.existsSync(source)) {
+      throw new Error(`Build secret source does not exist: ${source}`);
+    }
+
+    return ["--secret", secret];
+  });
+}
+
 function shellQuote(value: string | number): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function assertValidSshServer(server: string): void {
+  const label = "[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?";
+  const hostname = `${label}(?:\\.${label})*`;
+  const ipv4 = "(?:\\d{1,3}\\.){3}\\d{1,3}";
+  const username = "[A-Za-z0-9_][A-Za-z0-9_.-]*";
+  const serverPattern = new RegExp(
+    `^(?:${username}@)?(?:${hostname}|${ipv4})$`,
+  );
+
+  if (!serverPattern.test(server)) {
+    throw new Error(
+      `Invalid SSH server: ${server}. Expected [user@]host using letters, numbers, dots, hyphens, or underscores.`,
+    );
+  }
 }
 
 function getEnvironment(
@@ -122,6 +213,7 @@ function getEnvironment(
     throw new Error(`Unknown environment: ${environmentName}`);
   }
 
+  assertValidSshServer(env.server);
   return env;
 }
 
@@ -295,6 +387,11 @@ async function deploy(
     options.keepImages,
     DEFAULT_KEEP_IMAGES,
   );
+  const buildArgs = options.buildArg ?? [];
+  const buildSecrets = options.buildSecret ?? [];
+
+  assertSafeBuildArgs(buildArgs);
+  const dockerBuildSecretArgs = toDockerBuildSecretArgs(buildSecrets);
 
   if (environmentName === "production" && !options.confirm) {
     throw new Error(
@@ -332,11 +429,11 @@ async function deploy(
   const commitHash = await output("git", ["rev-parse", "--short", "HEAD"]);
   const imageTag = `${env.imageName}:${environmentName}-${commitHash}`;
   const tarFile = `${os.tmpdir()}/${env.imageName}-${environmentName}-${commitHash}.tar`;
-  const buildArgs = options.buildArg ?? [];
   const dockerBuildArgs = [
     "build",
     ...(options.noCache ? ["--no-cache"] : []),
     ...buildArgs.flatMap((arg) => ["--build-arg", arg]),
+    ...dockerBuildSecretArgs,
     "-t",
     imageTag,
     ".",
@@ -346,10 +443,17 @@ async function deploy(
   await run("docker", dockerBuildArgs);
 
   console.log("Saving Docker image...");
-  await runShell(`docker save ${imageTag} > ${tarFile}`);
+  await saveDockerImage(imageTag, tarFile);
+
+  console.log("Creating secure remote temp directory...");
+  const remoteTempDir = await output("ssh", [
+    env.server,
+    "mktemp -d /tmp/pongreay.XXXXXX",
+  ]);
+  const remoteTarFile = `${remoteTempDir}/image.tar`;
 
   console.log("Uploading image to server...");
-  const remoteTarFile = `/tmp/${env.imageName}-${environmentName}-${commitHash}.tar`; await run("scp", [tarFile, `${env.server}:${remoteTarFile}`]);
+  await run("scp", [tarFile, `${env.server}:${remoteTarFile}`]);
 
   const remoteCommand = `
 set -e
@@ -358,6 +462,7 @@ APP_NAME=${shellQuote(env.appName)}
 IMAGE_REPO=${shellQuote(env.imageName)}
 ENV_NAME=${shellQuote(environmentName)}
 IMAGE_TAG=${shellQuote(imageTag)}
+IMAGE_DIR=${shellQuote(remoteTempDir)}
 IMAGE_FILE=${shellQuote(remoteTarFile)}
 ENV_FILE=${shellQuote(env.envFileOnServer)}
 HOST_PORT=${shellQuote(env.hostPort)}
@@ -365,6 +470,11 @@ CONTAINER_PORT=${shellQuote(env.containerPort)}
 HEALTH_URL=${shellQuote(`http://127.0.0.1:${env.hostPort}${config.healthPath}`)}
 HEALTH_TIMEOUT=${shellQuote(healthTimeout)}
 KEEP_IMAGES=${shellQuote(keepImages)}
+
+cleanup() {
+  rm -rf "$IMAGE_DIR"
+}
+trap cleanup EXIT
 
 echo "Checking env file..."
 if [ ! -f "$ENV_FILE" ]; then
@@ -408,6 +518,10 @@ echo "Starting new container..."
 docker run -d \\
   --name "$APP_NAME" \\
   --restart unless-stopped \\
+  --cap-drop ALL \\
+  --security-opt no-new-privileges \\
+  --read-only \\
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \\
   --env-file "$ENV_FILE" \\
   --label "pongreay.environment=$ENV_NAME" \\
   --label "pongreay.previous-image=$OLD_IMAGE" \\
@@ -430,7 +544,6 @@ done
 
 if [ "$SUCCESS" = "true" ]; then
   echo "Deployment success."
-  rm -f "$IMAGE_FILE"
   if [ "$KEEP_IMAGES" -gt 0 ]; then
     docker images "$IMAGE_REPO" --format '{{.Repository}}:{{.Tag}}' \\
       | grep ":$ENV_NAME-" \\
@@ -449,13 +562,16 @@ if [ -n "$OLD_IMAGE" ]; then
   docker run -d \\
     --name "$APP_NAME" \\
     --restart unless-stopped \\
+    --cap-drop ALL \\
+    --security-opt no-new-privileges \\
+    --read-only \\
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m \\
     --env-file "$ENV_FILE" \\
     --label "pongreay.environment=$ENV_NAME" \\
     -p "$HOST_PORT:$CONTAINER_PORT" \\
     "$OLD_IMAGE"
 fi
 
-rm -f "$IMAGE_FILE"
 exit 1
 `;
 
@@ -526,6 +642,10 @@ docker rm "$APP_NAME" 2>/dev/null || true
 docker run -d \\
   --name "$APP_NAME" \\
   --restart unless-stopped \\
+  --cap-drop ALL \\
+  --security-opt no-new-privileges \\
+  --read-only \\
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \\
   --env-file "$ENV_FILE" \\
   --label "pongreay.environment=$ENV_NAME" \\
   -p "$HOST_PORT:$CONTAINER_PORT" \\
@@ -706,6 +826,7 @@ program
   .option("--skip-tests", "skip npm test")
   .option("--no-cache", "build Docker image without cache")
   .option("--build-arg <arg>", "pass Docker build argument", collect, [])
+  .option("--build-secret <secret>", "pass Docker BuildKit secret as id=<name>,src=<file>", collect, [])
   .option("--timeout <seconds>", "health-check timeout in seconds", "30")
   .option("--keep-images <count>", "remote images to keep after success", "5")
   .action(async (environment: string | undefined, options: DeployOptions) => {
