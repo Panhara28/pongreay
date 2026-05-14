@@ -210,6 +210,12 @@ sudo chmod 600 /etc/pongreay/my-app/production.env
   - Docker
   - A protected environment file under `/etc/pongreay/` specified by `envFileOnServer`.
 
+## Supply Chain Security
+
+Pongreay is a deployment CLI and intentionally invokes local tools such as `git`, `docker`, `ssh`, and `scp`. It does not use npm install hooks, and runtime dependencies are kept minimal.
+
+Install Pongreay from the official npm package and review your `pongreay.config.yml` before deploying. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
 ## How it Works
 
 1. **Pre-flight Checks:** Verifies the current Git branch and ensures there are no uncommitted changes.

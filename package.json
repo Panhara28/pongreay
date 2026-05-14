@@ -1,13 +1,45 @@
 {
   "name": "pongreay",
   "version": "0.1.0",
+  "description": "Security-focused Docker deployment CLI for modern applications.",
   "type": "module",
+  "license": "MIT",
+  "author": "panhara28 <titpanhara@gmail.com>",
+  "homepage": "https://github.com/Panhara28/pongreay#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Panhara28/pongreay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Panhara28/pongreay/issues"
+  },
+  "keywords": [
+    "docker",
+    "deployment",
+    "cli",
+    "ssh",
+    "devops",
+    "security"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "bin": {
     "pongreay": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepack": "npm run build",
     "start": "node dist/index.js"
   },
   "dependencies": {
