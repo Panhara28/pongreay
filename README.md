@@ -65,6 +65,26 @@ environments:
     containerPort: 3000
 ```
 
+#### Docker networks (optional)
+
+Each deploy recreates the container on Docker's default bridge, where other
+containers can't reach it by name. To keep it on a user-defined network —
+e.g. so a frontend container can call `http://my-app-uat:3000` — list the
+networks per environment:
+
+```yaml
+  uat:
+    # ...
+    networks: [my-app-net]   # or a single name: networks: my-app-net
+```
+
+After the new container starts (and before the health check) it is connected
+to each network; it also stays on the default bridge. The networks must
+already exist on the server (`docker network create my-app-net`) — the deploy
+checks this before stopping the old container, so a missing network never
+causes downtime. Rollbacks reconnect the networks too, and
+`pongreay doctor <environment>` reports any that are missing.
+
 ### 3. Deploy
 
 Deploy to UAT:

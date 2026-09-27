@@ -16,6 +16,10 @@ interface PongreayEnvironment {
   envFileOnServer: string;
   hostPort: number;
   containerPort: number;
+  // Extra Docker networks to attach the container to after it starts (e.g. a
+  // user-defined bridge so sibling containers can reach it by name). The
+  // container also stays on Docker's default bridge.
+  networks?: string[] | string;
 }
 
 
@@ -187,6 +191,53 @@ function shellQuote(value: string | number): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+const NETWORK_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
+// The environment's extra Docker networks, validated. Accepts a list or a
+// single name.
+function environmentNetworks(env: PongreayEnvironment, name = "environment"): string[] {
+  const raw = env.networks;
+  if (raw === undefined || raw === null) return [];
+  const list = Array.isArray(raw) ? raw : [raw];
+
+  for (const network of list) {
+    if (typeof network !== "string" || !NETWORK_NAME_PATTERN.test(network)) {
+      throw new Error(
+        `Invalid environments.${name}.networks entry: ${String(network)}. Use Docker network names (letters, digits, _ . -).`,
+      );
+    }
+  }
+
+  return [...new Set(list)];
+}
+
+// Shell: fail unless every network exists on the server. Runs before the old
+// container is stopped, so a missing network never causes downtime.
+function checkNetworksScript(networks: string[]): string {
+  if (networks.length === 0) return "";
+  return `
+echo "Checking Docker networks..."
+for NET in ${networks.map(shellQuote).join(" ")}; do
+  if ! docker network inspect "$NET" >/dev/null 2>&1; then
+    echo "Docker network does not exist on the server: $NET"
+    echo "Create it with: docker network create $NET"
+    exit 1
+  fi
+done
+`;
+}
+
+// Shell: attach the (just started) container to each network.
+function connectNetworksScript(networks: string[], { ignoreErrors = false } = {}): string {
+  if (networks.length === 0) return "";
+  return `
+for NET in ${networks.map(shellQuote).join(" ")}; do
+  echo "Connecting $APP_NAME to network $NET..."
+  docker network connect "$NET" "$APP_NAME"${ignoreErrors ? " || true" : ""}
+done
+`;
+}
+
 function assertValidSshServer(server: string): void {
   const label = "[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?";
   const hostname = `${label}(?:\\.${label})*`;
@@ -349,6 +400,7 @@ function validateConfig(): PongreayConfig {
     }
 
     assertEnvFileOutsideApp(env.envFileOnServer);
+    environmentNetworks(env, name);
   }
 
   assertDockerignoreProtectsEnv();
@@ -409,6 +461,8 @@ async function deploy(
   console.log(`Container: ${env.appName}`);
   console.log(`Image: ${env.imageName}`);
   console.log(`Port: ${env.hostPort}:${env.containerPort}`);
+  const networks = environmentNetworks(env, environmentName);
+  if (networks.length > 0) console.log(`Networks: ${networks.join(", ")}`);
   console.log("");
 
   if (options.dryRun) {
@@ -504,6 +558,7 @@ if [ "$ENV_PERMS" != "600" ] && [ "$ENV_PERMS" != "400" ]; then
   exit 1
 fi
 
+${checkNetworksScript(networks)}
 echo "Remember old image..."
 OLD_IMAGE=$(docker inspect --format='{{.Config.Image}}' "$APP_NAME" 2>/dev/null || true)
 
@@ -527,7 +582,7 @@ docker run -d \\
   --label "pongreay.previous-image=$OLD_IMAGE" \\
   -p "$HOST_PORT:$CONTAINER_PORT" \\
   "$IMAGE_TAG"
-
+${connectNetworksScript(networks)}
 echo "Checking health..."
 SUCCESS=false
 ATTEMPTS=$(( (HEALTH_TIMEOUT + 2) / 3 ))
@@ -570,7 +625,7 @@ if [ -n "$OLD_IMAGE" ]; then
     --label "pongreay.environment=$ENV_NAME" \\
     -p "$HOST_PORT:$CONTAINER_PORT" \\
     "$OLD_IMAGE"
-fi
+${connectNetworksScript(networks, { ignoreErrors: true })}fi
 
 exit 1
 `;
@@ -619,6 +674,7 @@ curl -fsS "$HEALTH_URL" >/dev/null && echo "healthy: $HEALTH_URL" || echo "unhea
 async function rollback(environmentName: string): Promise<void> {
   const config = loadConfig();
   const env = getEnvironment(config, environmentName);
+  const networks = environmentNetworks(env, environmentName);
   const command = `
 set -e
 
@@ -650,7 +706,7 @@ docker run -d \\
   --label "pongreay.environment=$ENV_NAME" \\
   -p "$HOST_PORT:$CONTAINER_PORT" \\
   "$PREVIOUS_IMAGE"
-
+${connectNetworksScript(networks)}
 curl -fsS "$HEALTH_URL" >/dev/null
 echo "Rollback successful."
 `;
@@ -685,10 +741,14 @@ async function doctor(environmentName?: string): Promise<void> {
   if (!environmentName) return;
 
   const env = getEnvironment(config, environmentName);
+  const networks = environmentNetworks(env, environmentName);
   const remoteCommand = `
 set -e
 ENV_FILE=${shellQuote(env.envFileOnServer)}
 command -v docker >/dev/null && echo "OK remote docker" || echo "FAIL remote docker"
+${networks
+  .map((n) => `docker network inspect ${shellQuote(n)} >/dev/null 2>&1 && echo "OK remote network ${n}" || echo "FAIL remote network missing: ${n}"`)
+  .join("\n")}
 if [ -f "$ENV_FILE" ]; then
   echo "OK remote env exists"
   stat -c "env owner=%U group=%G perms=%a path=%n" "$ENV_FILE"
