@@ -1,6 +1,6 @@
 {
   "name": "pongreay",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Security-focused Docker deployment CLI for modern applications.",
   "type": "module",
   "license": "MIT",
