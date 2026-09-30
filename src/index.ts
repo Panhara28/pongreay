@@ -791,7 +791,7 @@ const program = new Command();
 program
   .name("pongreay")
   .description("Secure Docker deployment CLI")
-  .version("0.1.3");
+  .version("0.1.4");
 
 program
   .command("init")

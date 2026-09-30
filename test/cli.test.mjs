@@ -18,7 +18,7 @@ test("prints the package version", () => {
   const result = runCli(["--version"]);
 
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /^0\.1\.3\s*$/);
+  assert.match(result.stdout, /^0\.1\.4\s*$/);
 });
 
 test("init creates config and protects local env files", async () => {
