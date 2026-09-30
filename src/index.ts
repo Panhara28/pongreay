@@ -550,12 +550,24 @@ if [ "$ENV_OWNER" != "$CURRENT_USER" ] && [ "$ENV_OWNER" != "root" ]; then
   exit 1
 fi
 
-chmod 600 "$ENV_FILE" 2>/dev/null || true
+ENV_GROUP=$(stat -c "%G" "$ENV_FILE")
 ENV_PERMS=$(stat -c "%a" "$ENV_FILE")
 
-if [ "$ENV_PERMS" != "600" ] && [ "$ENV_PERMS" != "400" ]; then
-  echo "Env file permissions must be 600 or 400. Current permissions: $ENV_PERMS"
-  exit 1
+# A root-owned file shared with a group the deploy user belongs to (e.g.
+# root:docker 640) is allowed as-is: the deploy user can't chmod it, and
+# "other" still has no access.
+if [ "$ENV_OWNER" = "root" ] && [ "$ENV_OWNER" != "$CURRENT_USER" ] \\
+  && { [ "$ENV_PERMS" = "640" ] || [ "$ENV_PERMS" = "440" ]; } \\
+  && id -Gn | tr ' ' '\\n' | grep -qx "$ENV_GROUP"; then
+  echo "Env file is root:$ENV_GROUP $ENV_PERMS (group-readable by $CURRENT_USER)."
+else
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+  ENV_PERMS=$(stat -c "%a" "$ENV_FILE")
+
+  if [ "$ENV_PERMS" != "600" ] && [ "$ENV_PERMS" != "400" ]; then
+    echo "Env file permissions must be 600 or 400 (or 640/440 when owned by root and group-shared with $CURRENT_USER). Current: $ENV_OWNER:$ENV_GROUP $ENV_PERMS"
+    exit 1
+  fi
 fi
 
 ${checkNetworksScript(networks)}

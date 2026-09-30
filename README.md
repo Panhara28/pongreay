@@ -208,7 +208,7 @@ Before deployment, Pongreay requires:
 - `envFileOnServer` is under `/etc/pongreay/`, outside the app directory.
 - The server env file exists and is readable by the deploy user.
 - The server env file owner is the deploy user or `root`.
-- The server env file permissions are `600` or `400`; Pongreay attempts `chmod 600` before enforcing this.
+- The server env file permissions are `600` or `400`; Pongreay attempts `chmod 600` before enforcing this. A `root`-owned file may instead be `640` or `440` when its group is one the deploy user belongs to (for example `root:docker 640`), since the deploy user can't `chmod` it and other users still have no access.
 
 Example server setup:
 
